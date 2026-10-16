@@ -1,4 +1,4 @@
-name: Try to Create OCI ARM VM
+name: OCI ARM Retry (2 CPU, 12 GB, 200 GB)
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
     # Enable only after OCI credentials and networking are ready.
     if: vars.OCI_AUTOMATION_ENABLED == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 350
     steps:
       - name: Install the official Oracle CLI
         run: |
@@ -26,7 +26,7 @@ jobs:
           "$RUNNER_TEMP/oci-venv/bin/pip" install --disable-pip-version-check 'oci-cli==3.95.0'
           echo "$RUNNER_TEMP/oci-venv/bin" >> "$GITHUB_PATH"
 
-      - name: Check for an existing VM and try one launch
+      - name: Retry every 10 minutes, stopping when a VM exists
         env:
           OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
           OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
@@ -58,8 +58,15 @@ jobs:
           openssl pkey -in "$OCI_CLI_KEY_FILE" -check -noout >/dev/null
           ssh-keygen -l -f "$work_dir/ssh.pub" >/dev/null
 
+          # Keep retries running even when GitHub delays a cron event.
+          # 35 starts at 10-minute intervals fit inside the 350-minute job limit.
+          max_attempts=35
+          retry_interval=600
+          for ((attempt=1; attempt<=max_attempts; attempt++)); do
+          attempt_started=$SECONDS
+          echo "::notice::Attempt $attempt/$max_attempts at $(date -u +%Y-%m-%dT%H:%M:%SZ): 2 OCPUs / 12 GB / 200 GB"
           # Fail closed if listing fails. Never launch a second active A1 VM.
-          oci compute instance list --compartment-id "$OCI_COMPARTMENT_ID" --all > "$work_dir/instances.json"
+          timeout 180s oci compute instance list --compartment-id "$OCI_COMPARTMENT_ID" --all > "$work_dir/instances.json"
           active_count=$(jq -s '[.[].data[]? | select(.shape == "VM.Standard.A1.Flex" and ."lifecycle-state" != "TERMINATED")] | length' "$work_dir/instances.json")
           if [ "$active_count" -gt 0 ]; then
             echo 'An A1 instance already exists. No new instance was requested.' >> "$GITHUB_STEP_SUMMARY"
@@ -68,7 +75,7 @@ jobs:
           fi
 
           # Use the documented Always Free A1 allowance: 2 OCPUs / 12 GB.
-          if oci compute instance launch \
+          if timeout 180s oci compute instance launch \
             --compartment-id "$OCI_COMPARTMENT_ID" \
             --availability-domain "$AD_NAME" \
             --shape VM.Standard.A1.Flex \
@@ -82,8 +89,10 @@ jobs:
             jq -e '.data.id and (.data."lifecycle-state" == "PROVISIONING" or .data."lifecycle-state" == "RUNNING")' "$work_dir/result.json" >/dev/null
             echo 'VM creation accepted: A1 Flex, 2 OCPUs, 12 GB RAM, 200 GB boot disk.' >> "$GITHUB_STEP_SUMMARY"
             echo 'Check Oracle Cloud for its status and IP. Disable this workflow when provisioning completes.' >> "$GITHUB_STEP_SUMMARY"
+            echo '::notice::VM creation accepted. Stopping retries.'
+            exit 0
           elif grep -qi 'out of host capacity' "$work_dir/error.log"; then
-            echo 'Waiting for Oracle capacity. No VM was created; a later scheduled run will retry.' >> "$GITHUB_STEP_SUMMARY"
+            echo "Attempt $attempt at $(date -u +%Y-%m-%dT%H:%M:%SZ): Oracle has no host capacity; no VM was created." | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo '::error::OCI launch failed for a reason other than capacity. Check credentials, ARM image, subnet, quota and storage allowance.'
             python3 - "$work_dir/error.log" <<'PY' >> "$GITHUB_STEP_SUMMARY"
@@ -102,3 +111,12 @@ jobs:
           PY
             exit 1
           fi
+          if [ "$attempt" -lt "$max_attempts" ]; then
+            remaining=$((retry_interval - (SECONDS - attempt_started)))
+            if [ "$remaining" -gt 0 ]; then
+              echo "::notice::Next attempt $((attempt + 1))/$max_attempts in ${remaining}s. This run stays active while waiting."
+              sleep "$remaining"
+            fi
+          fi
+          done
+          echo 'Retry window finished without capacity. A new scheduled or manual run is required to continue.' | tee -a "$GITHUB_STEP_SUMMARY"
