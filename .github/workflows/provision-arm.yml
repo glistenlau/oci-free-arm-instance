@@ -62,8 +62,12 @@ jobs:
           # 35 starts at 10-minute intervals fit inside the 350-minute job limit.
           max_attempts=35
           retry_interval=600
+          throttle_wait=1200
+          retry_deadline=$((SECONDS + 340 * 60))
           for ((attempt=1; attempt<=max_attempts; attempt++)); do
+          if [ "$SECONDS" -gt "$retry_deadline" ]; then break; fi
           attempt_started=$SECONDS
+          attempt_interval=$retry_interval
           echo "::notice::Attempt $attempt/$max_attempts at $(date -u +%Y-%m-%dT%H:%M:%SZ): 2 OCPUs / 12 GB / 200 GB"
           # Fail closed if listing fails. Never launch a second active A1 VM.
           timeout 180s oci compute instance list --compartment-id "$OCI_COMPARTMENT_ID" --all > "$work_dir/instances.json"
@@ -75,7 +79,7 @@ jobs:
           fi
 
           # Use the documented Always Free A1 allowance: 2 OCPUs / 12 GB.
-          if timeout 180s oci compute instance launch \
+          if timeout 180s oci compute instance launch --no-retry \
             --compartment-id "$OCI_COMPARTMENT_ID" \
             --availability-domain "$AD_NAME" \
             --shape VM.Standard.A1.Flex \
@@ -92,10 +96,15 @@ jobs:
             echo '::notice::VM creation accepted. Stopping retries.'
             exit 0
           elif grep -qi 'out of host capacity' "$work_dir/error.log"; then
+            throttle_wait=1200
             echo "Attempt $attempt at $(date -u +%Y-%m-%dT%H:%M:%SZ): Oracle has no host capacity; no VM was created." | tee -a "$GITHUB_STEP_SUMMARY"
+          elif grep -q '"code": *"TooManyRequests"' "$work_dir/error.log"; then
+            attempt_interval=$throttle_wait
+            echo "Attempt $attempt at $(date -u +%Y-%m-%dT%H:%M:%SZ): Oracle rate limited the launch (429). Backing off for $((attempt_interval / 60)) minutes." | tee -a "$GITHUB_STEP_SUMMARY"
+            throttle_wait=$((throttle_wait < 1800 ? throttle_wait * 2 : 3600))
           else
             echo '::error::OCI launch failed for a reason other than capacity. Check credentials, ARM image, subnet, quota and storage allowance.'
-            python3 - "$work_dir/error.log" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+            python3 - "$work_dir/error.log" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json, os, re, sys
           raw = open(sys.argv[1]).read()
           try:
@@ -112,7 +121,11 @@ jobs:
             exit 1
           fi
           if [ "$attempt" -lt "$max_attempts" ]; then
-            remaining=$((retry_interval - (SECONDS - attempt_started)))
+            remaining=$((attempt_interval - (SECONDS - attempt_started)))
+            if [ "$((SECONDS + remaining))" -gt "$retry_deadline" ]; then
+              echo 'Retry backoff would exceed this run window; stopping before the runner timeout.' | tee -a "$GITHUB_STEP_SUMMARY"
+              break
+            fi
             if [ "$remaining" -gt 0 ]; then
               echo "::notice::Next attempt $((attempt + 1))/$max_attempts in ${remaining}s. This run stays active while waiting."
               sleep "$remaining"
