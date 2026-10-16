@@ -59,7 +59,7 @@ jobs:
 
           # Fail closed if listing fails. Never launch a second active A1 VM.
           oci compute instance list --compartment-id "$OCI_COMPARTMENT_ID" --all > "$work_dir/instances.json"
-          active_count=$(jq '[.data[]? | select(.shape == "VM.Standard.A1.Flex" and ."lifecycle-state" != "TERMINATED")] | length' "$work_dir/instances.json")
+          active_count=$(jq -s '[.[].data[]? | select(.shape == "VM.Standard.A1.Flex" and ."lifecycle-state" != "TERMINATED")] | length' "$work_dir/instances.json")
           if [ "$active_count" -gt 0 ]; then
             echo 'An A1 instance already exists. No new instance was requested.' >> "$GITHUB_STEP_SUMMARY"
             echo 'Disable this workflow after confirming the instance in Oracle Cloud.' >> "$GITHUB_STEP_SUMMARY"
@@ -68,7 +68,6 @@ jobs:
 
           # User requested 4 OCPUs / 24 GB. Free Tier docs currently list 2 / 12.
           # This size may use trial credits; paid tenancies have a larger free allowance.
-          retry_token=$(printf '%s' "$GITHUB_REPOSITORY:$AD_NAME:$INSTANCE_NAME" | sha256sum | cut -c1-64)
           if oci compute instance launch \
             --compartment-id "$OCI_COMPARTMENT_ID" \
             --availability-domain "$AD_NAME" \
@@ -79,8 +78,7 @@ jobs:
             --ssh-authorized-keys-file "$work_dir/ssh.pub" \
             --assign-public-ip true \
             --display-name "$INSTANCE_NAME" \
-            --boot-volume-size-in-gbs 50 \
-            --opc-retry-token "$retry_token" > "$work_dir/result.json" 2> "$work_dir/error.log"; then
+            --boot-volume-size-in-gbs 50 > "$work_dir/result.json" 2> "$work_dir/error.log"; then
             jq -e '.data.id and (.data."lifecycle-state" == "PROVISIONING" or .data."lifecycle-state" == "RUNNING")' "$work_dir/result.json" >/dev/null
             echo 'VM creation accepted: A1 Flex, 4 OCPUs, 24 GB RAM, 50 GB boot disk.' >> "$GITHUB_STEP_SUMMARY"
             echo 'Check Oracle Cloud for its status and IP. Disable this workflow when provisioning completes.' >> "$GITHUB_STEP_SUMMARY"
@@ -88,6 +86,19 @@ jobs:
             echo 'Waiting for Oracle capacity. No VM was created; a later scheduled run will retry.' >> "$GITHUB_STEP_SUMMARY"
           else
             echo '::error::OCI launch failed for a reason other than capacity. Check credentials, ARM image, subnet, quota and storage allowance.'
-            echo 'OCI launch failed. Raw response omitted to keep account details out of this public repository.' >> "$GITHUB_STEP_SUMMARY"
+            python3 - "$work_dir/error.log" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, re, sys
+          raw = open(sys.argv[1]).read()
+          try:
+              error = json.loads(raw[raw.index('{'):])
+              detail = json.dumps({key: error.get(key) for key in ('code', 'message', 'status')})
+          except (ValueError, json.JSONDecodeError):
+              detail = '\n'.join(line for line in raw.splitlines() if line.startswith(('Error:', 'Usage:'))) or 'OCI returned an unrecognized error.'
+          for name, value in os.environ.items():
+              if value and len(value) > 6 and (name.startswith('OCI_') or name in ('AD_NAME', 'IMAGE_ID', 'SSH_PUBLIC_KEY')):
+                  detail = detail.replace(value, '[redacted]')
+          detail = re.sub(r'ocid1\.[A-Za-z0-9._-]+', '[redacted OCID]', detail)
+          print('OCI launch failed: ' + detail[:2000])
+          PY
             exit 1
           fi
