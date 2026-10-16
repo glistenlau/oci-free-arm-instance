@@ -8,7 +8,7 @@ This fork uses [provision-arm.yml](.github/workflows/provision-arm.yml) to reque
 | Memory | 12 GB |
 | Boot volume | 200 GB |
 | Instance name | `oci-free-arm` |
-| Retry interval inside a running job | 600 seconds between attempt starts |
+| Retry interval inside a running job | 600 seconds between capacity attempts; longer on throttling |
 | Maximum attempts per run | 35 |
 | Job timeout | 350 minutes |
 
@@ -27,13 +27,18 @@ The cron expression `4,14,24,34,44,54 * * * *` also requests new runs. GitHub sc
 
 [GitHub scheduling troubleshooting](https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflows-running-at-unexpected-times) · [GitHub runner limits](https://docs.github.com/en/actions/reference/limits)
 
+## Diagnose scheduled triggers
+
+[cron-diagnostic.yml](.github/workflows/cron-diagnostic.yml) uses the same cron expression and only prints the event, workflow reference and UTC start time. It has no OCI credentials, conditional gate or concurrency lock. A manual run validates the runner and YAML only. Compare runs labeled **Scheduled** to determine whether the missing trigger also affects this minimal workflow. Disable this diagnostic workflow after investigation.
+
 ## Results and stopping
 
 - **Out of host capacity:** wait until the next attempt in the same run.
+- **Launch throttled (429 / TooManyRequests):** keep retrying after 20, 40, then at most 60 minutes for consecutive throttles. A capacity response resets this backoff. Launch uses `--no-retry` so the CLI does not issue its own burst of retries inside a single attempt.
 - **VM creation accepted:** retries stop. Confirm the instance state and public IP in Oracle Cloud.
 - **An A1 instance already exists:** no additional instance is requested. The inventory check runs before every attempt and stops if it fails.
 - **Other errors:** the job fails immediately with sanitized error details. Fix the configuration before restarting.
-- **Retry window finished:** all 35 attempts completed without capacity. A new run is needed.
+- **Retry window finished:** the attempt or time budget was reached. A new run is needed; the loop ends before its 350-minute runner limit.
 
 A green Actions status alone does not mean a VM was created; read the summary. Concurrency prevents two provisioning jobs from running at once.
 
