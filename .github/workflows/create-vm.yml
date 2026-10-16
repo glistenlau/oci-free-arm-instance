@@ -78,9 +78,9 @@ jobs:
             --ssh-authorized-keys-file "$work_dir/ssh.pub" \
             --assign-public-ip true \
             --display-name "$INSTANCE_NAME" \
-            --boot-volume-size-in-gbs 50 > "$work_dir/result.json" 2> "$work_dir/error.log"; then
+            --boot-volume-size-in-gbs 200 > "$work_dir/result.json" 2> "$work_dir/error.log"; then
             jq -e '.data.id and (.data."lifecycle-state" == "PROVISIONING" or .data."lifecycle-state" == "RUNNING")' "$work_dir/result.json" >/dev/null
-            echo 'VM creation accepted: A1 Flex, 4 OCPUs, 24 GB RAM, 50 GB boot disk.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'VM creation accepted: A1 Flex, 4 OCPUs, 24 GB RAM, 200 GB boot disk.' >> "$GITHUB_STEP_SUMMARY"
             echo 'Check Oracle Cloud for its status and IP. Disable this workflow when provisioning completes.' >> "$GITHUB_STEP_SUMMARY"
           elif grep -qi 'out of host capacity' "$work_dir/error.log"; then
             echo 'Waiting for Oracle capacity. No VM was created; a later scheduled run will retry.' >> "$GITHUB_STEP_SUMMARY"
