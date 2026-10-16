@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   create-vm:
-    # Enable only after the OCI secrets, networking, and free allowance are verified.
+    # Enable only after OCI credentials and networking are ready.
     if: vars.OCI_AUTOMATION_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -66,14 +66,14 @@ jobs:
             exit 0
           fi
 
-          # 2 OCPUs / 12 GB is the currently documented Always Free allowance.
-          # Increase only after verifying the applicable billing allowance.
+          # User requested 4 OCPUs / 24 GB. Free Tier docs currently list 2 / 12.
+          # This size may use trial credits; paid tenancies have a larger free allowance.
           retry_token=$(printf '%s' "$GITHUB_REPOSITORY:$AD_NAME:$INSTANCE_NAME" | sha256sum | cut -c1-64)
           if oci compute instance launch \
             --compartment-id "$OCI_COMPARTMENT_ID" \
             --availability-domain "$AD_NAME" \
             --shape VM.Standard.A1.Flex \
-            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
             --subnet-id "$OCI_SUBNET_ID" \
             --image-id "$IMAGE_ID" \
             --ssh-authorized-keys-file "$work_dir/ssh.pub" \
@@ -82,7 +82,7 @@ jobs:
             --boot-volume-size-in-gbs 50 \
             --opc-retry-token "$retry_token" > "$work_dir/result.json" 2> "$work_dir/error.log"; then
             jq -e '.data.id and (.data."lifecycle-state" == "PROVISIONING" or .data."lifecycle-state" == "RUNNING")' "$work_dir/result.json" >/dev/null
-            echo 'VM creation accepted: A1 Flex, 2 OCPUs, 12 GB RAM, 50 GB boot disk.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'VM creation accepted: A1 Flex, 4 OCPUs, 24 GB RAM, 50 GB boot disk.' >> "$GITHUB_STEP_SUMMARY"
             echo 'Check Oracle Cloud for its status and IP. Disable this workflow when provisioning completes.' >> "$GITHUB_STEP_SUMMARY"
           elif grep -qi 'out of host capacity' "$work_dir/error.log"; then
             echo 'Waiting for Oracle capacity. No VM was created; a later scheduled run will retry.' >> "$GITHUB_STEP_SUMMARY"
