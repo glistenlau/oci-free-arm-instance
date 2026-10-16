@@ -1,0 +1,26 @@
+name: Cron diagnostic
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '4,14,24,34,44,54 * * * *'
+
+permissions: {}
+
+jobs:
+  clock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Record the trigger and UTC time
+        env:
+          TRIGGER: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          {
+            printf 'Event: %s\n' "$TRIGGER"
+            printf 'Schedule: %s\n' "$SCHEDULE"
+            printf 'Workflow: %s\n' "$WORKFLOW_REF"
+            printf 'Runner start (UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
