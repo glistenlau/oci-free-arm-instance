@@ -1,0 +1,93 @@
+name: Try to Create OCI ARM VM
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oci-free-arm-instance
+  cancel-in-progress: false
+
+jobs:
+  create-vm:
+    # Enable only after the OCI secrets, networking, and free allowance are verified.
+    if: vars.OCI_AUTOMATION_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install the official Oracle CLI
+        run: |
+          python3 -m venv "$RUNNER_TEMP/oci-venv"
+          "$RUNNER_TEMP/oci-venv/bin/pip" install --disable-pip-version-check 'oci-cli==3.95.0'
+          echo "$RUNNER_TEMP/oci-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Check for an existing VM and try one launch
+        env:
+          OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          AD_NAME: ${{ secrets.AD_NAME }}
+          IMAGE_ID: ${{ secrets.IMAGE_ID }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          INSTANCE_NAME: oci-free-arm
+        shell: bash
+        run: |
+          set -euo pipefail
+          for setting in OCI_CLI_USER OCI_CLI_TENANCY OCI_CLI_FINGERPRINT OCI_CLI_REGION OCI_CLI_KEY_CONTENT OCI_COMPARTMENT_ID OCI_SUBNET_ID AD_NAME IMAGE_ID SSH_PUBLIC_KEY; do
+            if [ -z "${!setting}" ]; then
+              echo "::error::Missing repository secret: $setting"
+              exit 1
+            fi
+          done
+          umask 077
+          work_dir=$(mktemp -d "$RUNNER_TEMP/oci-launch.XXXXXX")
+          trap 'rm -rf "$work_dir"' EXIT
+          export OCI_CLI_KEY_FILE="$work_dir/api-key.pem"
+          printf '%s\n' "$OCI_CLI_KEY_CONTENT" > "$OCI_CLI_KEY_FILE"
+          printf '%s\n' "$SSH_PUBLIC_KEY" > "$work_dir/ssh.pub"
+          unset OCI_CLI_KEY_CONTENT
+          openssl pkey -in "$OCI_CLI_KEY_FILE" -check -noout >/dev/null
+          ssh-keygen -l -f "$work_dir/ssh.pub" >/dev/null
+
+          # Fail closed if listing fails. Never launch a second active A1 VM.
+          oci compute instance list --compartment-id "$OCI_COMPARTMENT_ID" --all > "$work_dir/instances.json"
+          active_count=$(jq '[.data[]? | select(.shape == "VM.Standard.A1.Flex" and ."lifecycle-state" != "TERMINATED")] | length' "$work_dir/instances.json")
+          if [ "$active_count" -gt 0 ]; then
+            echo 'An A1 instance already exists. No new instance was requested.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Disable this workflow after confirming the instance in Oracle Cloud.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # 2 OCPUs / 12 GB is the currently documented Always Free allowance.
+          # Increase only after verifying the applicable billing allowance.
+          retry_token=$(printf '%s' "$GITHUB_REPOSITORY:$AD_NAME:$INSTANCE_NAME" | sha256sum | cut -c1-64)
+          if oci compute instance launch \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --availability-domain "$AD_NAME" \
+            --shape VM.Standard.A1.Flex \
+            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+            --subnet-id "$OCI_SUBNET_ID" \
+            --image-id "$IMAGE_ID" \
+            --ssh-authorized-keys-file "$work_dir/ssh.pub" \
+            --assign-public-ip true \
+            --display-name "$INSTANCE_NAME" \
+            --boot-volume-size-in-gbs 50 \
+            --opc-retry-token "$retry_token" > "$work_dir/result.json" 2> "$work_dir/error.log"; then
+            jq -e '.data.id and (.data."lifecycle-state" == "PROVISIONING" or .data."lifecycle-state" == "RUNNING")' "$work_dir/result.json" >/dev/null
+            echo 'VM creation accepted: A1 Flex, 2 OCPUs, 12 GB RAM, 50 GB boot disk.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Check Oracle Cloud for its status and IP. Disable this workflow when provisioning completes.' >> "$GITHUB_STEP_SUMMARY"
+          elif grep -qi 'out of host capacity' "$work_dir/error.log"; then
+            echo 'Waiting for Oracle capacity. No VM was created; a later scheduled run will retry.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '::error::OCI launch failed for a reason other than capacity. Check credentials, ARM image, subnet, quota and storage allowance.'
+            echo 'OCI launch failed. Raw response omitted to keep account details out of this public repository.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
