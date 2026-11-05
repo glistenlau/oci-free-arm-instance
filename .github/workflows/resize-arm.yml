@@ -1,0 +1,151 @@
+name: Resize existing OCI ARM to 4 CPU and 24 GB
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oci-free-arm-instance
+  cancel-in-progress: false
+
+jobs:
+  resize-existing:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install the official Oracle CLI
+        run: |
+          python3 -m venv "$RUNNER_TEMP/oci-venv"
+          "$RUNNER_TEMP/oci-venv/bin/pip" install --disable-pip-version-check 'oci-cli==3.95.0'
+          echo "$RUNNER_TEMP/oci-venv/bin" >> "$GITHUB_PATH"
+      - name: Resize the existing ARM instance and verify 4 CPU, 24 GB, 200 GB
+        env:
+          OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          IMAGE_ID: ${{ secrets.IMAGE_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for setting in OCI_CLI_USER OCI_CLI_TENANCY OCI_CLI_FINGERPRINT OCI_CLI_REGION OCI_CLI_KEY_CONTENT OCI_COMPARTMENT_ID IMAGE_ID; do
+            if [ -z "${!setting}" ]; then
+              echo "::error::Missing repository secret: $setting"
+              exit 1
+            fi
+          done
+          umask 077
+          work_dir=$(mktemp -d "$RUNNER_TEMP/oci-resize.XXXXXX")
+          trap 'rm -rf "$work_dir"' EXIT
+          export OCI_CLI_KEY_FILE="$work_dir/api-key.pem"
+          printf '%s\n' "$OCI_CLI_KEY_CONTENT" > "$OCI_CLI_KEY_FILE"
+          unset OCI_CLI_KEY_CONTENT
+          openssl pkey -in "$OCI_CLI_KEY_FILE" -check -noout >/dev/null
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+          
+          
+          def oci_json(*arguments, timeout=180):
+              result = subprocess.run(
+                  ["oci", "--no-retry", *arguments],
+                  text=True, capture_output=True, timeout=timeout,
+              )
+              if result.returncode:
+                  raise RuntimeError(result.stderr or "OCI command failed")
+              return json.loads(result.stdout)["data"]
+          
+          
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+          
+          
+          def dimensions(instance):
+              shape = instance["shape-config"]
+              return shape["ocpus"], shape["memory-in-gbs"]
+          
+          
+          def main():
+              region = os.environ["OCI_CLI_REGION"]
+              compartment = os.environ["OCI_COMPARTMENT_ID"]
+              require(region == "us-sanjose-1", "Unexpected region; no resize performed.")
+              instances = oci_json("compute", "instance", "list", "--compartment-id", compartment, "--all")
+              active = [item for item in instances if item["shape"] == "VM.Standard.A1.Flex"
+                        and item["lifecycle-state"] != "TERMINATED"]
+              require(len(active) == 1, "Expected exactly one active A1 instance; no resize performed.")
+              instance = active[0]
+              require(instance["display-name"] == "oci-free-arm", "Unexpected instance name; no resize performed.")
+              instance_id = instance["id"]
+              for attempt in range(31):
+                  instance = oci_json("compute", "instance", "get", "--instance-id", instance_id)
+                  state = instance["lifecycle-state"]
+                  if state == "RUNNING":
+                      break
+                  require(state in ("PROVISIONING", "STARTING"), "Instance is not in a safe state for resizing.")
+                  require(attempt < 30, "Instance did not become RUNNING within five minutes.")
+                  time.sleep(10)
+              require(instance["shape"] == "VM.Standard.A1.Flex", "Unexpected instance shape.")
+              require(instance["display-name"] == "oci-free-arm", "Instance name changed during verification.")
+              require(instance["source-details"].get("image-id") == os.environ["IMAGE_ID"],
+                      "Unexpected source image; no resize performed.")
+              require(dimensions(instance) in ((2, 12), (4, 24)), "Unexpected current CPU/memory configuration.")
+              attachments = oci_json(
+                  "compute", "boot-volume-attachment", "list", "--compartment-id", compartment,
+                  "--availability-domain", instance["availability-domain"],
+                  "--instance-id", instance_id, "--all",
+              )
+              attached = [item for item in attachments if item["lifecycle-state"] == "ATTACHED"]
+              require(len(attached) == 1, "Expected one attached boot volume.")
+              boot_id = attached[0]["boot-volume-id"]
+              boot = oci_json("bv", "boot-volume", "get", "--boot-volume-id", boot_id)
+              require(boot["size-in-gbs"] == 200, "Boot volume is not the expected 200 GB.")
+              print(f"Verified existing A1: {dimensions(instance)[0]} OCPUs, {dimensions(instance)[1]} GB RAM, 200 GB boot volume.")
+              if dimensions(instance) == (2, 12):
+                  print("Requesting 4 OCPUs and 24 GB RAM for this instance; Oracle may reboot it.", flush=True)
+                  oci_json(
+                      "compute", "instance", "update", "--instance-id", instance_id,
+                      "--shape-config", '{"ocpus":4,"memoryInGBs":24}', "--force",
+                      "--wait-for-state", "RUNNING", "--max-wait-seconds", "900",
+                      "--wait-interval-seconds", "20", timeout=960,
+                  )
+              else:
+                  print("The instance already has 4 OCPUs and 24 GB RAM; no update was needed.")
+              final = oci_json("compute", "instance", "get", "--instance-id", instance_id)
+              require(final["lifecycle-state"] == "RUNNING" and final["shape"] == "VM.Standard.A1.Flex"
+                      and dimensions(final) == (4, 24), "Final instance state/configuration has not reached 4/24 RUNNING.")
+              boot = oci_json("bv", "boot-volume", "get", "--boot-volume-id", boot_id)
+              require(boot["size-in-gbs"] == 200, "Final boot volume size is not 200 GB.")
+              summary = (
+                  "Verified in Oracle Cloud: **oci-free-arm**\n\n"
+                  "| Property | Verified value |\n|---|---|\n"
+                  "| Region | us-sanjose-1 |\n| Shape | VM.Standard.A1.Flex |\n"
+                  "| State | RUNNING |\n| OCPUs | 4 |\n| Memory | 24 GB |\n"
+                  "| Existing boot volume | 200 GB |\n\n"
+                  "This manual workflow only updates the existing instance's CPU and memory.\n"
+              )
+              Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text(summary)
+              print("Verified RUNNING: A1 Flex, 4 OCPUs, 24 GB RAM, existing 200 GB boot volume.")
+          
+          
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as error:
+                  message = str(error)
+                  for key, value in os.environ.items():
+                      if value and len(value) > 6 and (key.startswith("OCI_") or key == "IMAGE_ID"):
+                          message = message.replace(value, "[redacted]")
+                  message = re.sub(r"ocid1\.[A-Za-z0-9._-]+", "[redacted OCID]", message)
+                  print("::error::" + message[:1800].replace("\n", " "))
+                  raise SystemExit(1)
+          PYTHON
